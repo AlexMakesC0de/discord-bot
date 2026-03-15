@@ -50,6 +50,12 @@ YOUTUBE_RE = re.compile(
 SPOTIFY_TRACK_RE = re.compile(
     r"(https?://)?open\.spotify\.com/track/([A-Za-z0-9]+)"
 )
+SPOTIFY_ALBUM_RE = re.compile(
+    r"(https?://)?open\.spotify\.com/album/([A-Za-z0-9]+)"
+)
+SPOTIFY_PLAYLIST_RE = re.compile(
+    r"(https?://)?open\.spotify\.com/playlist/([A-Za-z0-9]+)"
+)
 
 
 # ── Helper dataclass ──────────────────────────────────────────────────────────
@@ -121,6 +127,43 @@ def resolve_spotify_query(url: str) -> str | None:
     artist = track["artists"][0]["name"]
     title = track["name"]
     return f"{artist} - {title}"
+
+
+def resolve_spotify_album(url: str) -> list[str]:
+    """Convert a Spotify album URL into a list of 'Artist - Title' search strings."""
+    if sp is None:
+        return []
+    match = SPOTIFY_ALBUM_RE.match(url)
+    if not match:
+        return []
+    album_id = match.group(2)
+    results = sp.album_tracks(album_id)
+    queries = []
+    for track in results["items"]:
+        artist = track["artists"][0]["name"]
+        title = track["name"]
+        queries.append(f"{artist} - {title}")
+    return queries
+
+
+def resolve_spotify_playlist(url: str) -> list[str]:
+    """Convert a Spotify playlist URL into a list of 'Artist - Title' search strings."""
+    if sp is None:
+        return []
+    match = SPOTIFY_PLAYLIST_RE.match(url)
+    if not match:
+        return []
+    playlist_id = match.group(2)
+    results = sp.playlist_tracks(playlist_id)
+    queries = []
+    for item in results["items"]:
+        track = item.get("track")
+        if not track:
+            continue
+        artist = track["artists"][0]["name"]
+        title = track["name"]
+        queries.append(f"{artist} - {title}")
+    return queries
 
 
 async def extract_playlist(query: str, max_tracks: int = 25) -> list[dict]:
@@ -228,15 +271,56 @@ async def play(interaction: discord.Interaction, query: str):
 
     # Resolve the query
     search = query
-    if SPOTIFY_TRACK_RE.match(query):
+    spotify_multi = []
+
+    if SPOTIFY_ALBUM_RE.match(query):
+        spotify_multi = resolve_spotify_album(query)
+        if not spotify_multi:
+            await interaction.followup.send("❌ Could not resolve Spotify album. Check your Spotify API credentials.")
+            return
+    elif SPOTIFY_PLAYLIST_RE.match(query):
+        spotify_multi = resolve_spotify_playlist(query)
+        if not spotify_multi:
+            await interaction.followup.send("❌ Could not resolve Spotify playlist. Check your Spotify API credentials.")
+            return
+    elif SPOTIFY_TRACK_RE.match(query):
         resolved = resolve_spotify_query(query)
         if resolved is None:
             await interaction.followup.send("❌ Could not resolve Spotify track. Check your Spotify API credentials.")
             return
         search = resolved
     elif not YOUTUBE_RE.match(query):
-        # Plain search — prefix with ytsearch: for yt-dlp
         search = f"ytsearch:{query}"
+
+    # Handle Spotify albums/playlists (multiple tracks)
+    if spotify_multi:
+        queued_count = 0
+        first_song = None
+        was_playing = state.voice_client.is_playing() or state.voice_client.is_paused()
+
+        for sq in spotify_multi:
+            info = await extract_info(f"ytsearch:{sq}")
+            if info is None:
+                continue
+            song = Song(title=info.get("title", "Unknown"), url=info["url"], requester=member)
+            state.queue.append(song)
+            queued_count += 1
+            if first_song is None:
+                first_song = song
+
+        if queued_count == 0:
+            await interaction.followup.send("❌ Could not find any tracks.")
+            return
+
+        if not was_playing:
+            await play_next(interaction.guild_id)
+            await interaction.followup.send(
+                f"🎶 Now playing: **{first_song.title}**\n"
+                f"➕ Queued **{queued_count}** tracks from Spotify"
+            )
+        else:
+            await interaction.followup.send(f"➕ Queued **{queued_count}** tracks from Spotify")
+        return
 
     info = await extract_info(search)
     if info is None:
