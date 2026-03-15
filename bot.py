@@ -149,12 +149,11 @@ async def extract_playlist(query: str, max_tracks: int = 25) -> list[dict]:
                     playlist_url = url
                     break
 
-            # If no playlist found in search, try a direct playlist search
+            # If no playlist found, fall back to individual video results
             if not playlist_url:
-                results = ydl.extract_info(f"ytsearchplaylist:{query}", download=False)
+                results = ydl.extract_info(f"ytsearch{max_tracks}:{query}", download=False)
                 if not results or "entries" not in results or not results["entries"]:
                     return []
-                # Fallback: use individual search results as a pseudo-playlist
                 return results["entries"][:max_tracks]
 
             # Extract tracks from the playlist
