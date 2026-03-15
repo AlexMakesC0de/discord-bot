@@ -471,15 +471,12 @@ async def radio(interaction: discord.Interaction, genre: str = None):
         if not video_id:
             continue
 
-        # For flat-extracted playlist entries, we need to resolve the actual stream URL
-        if track.get("url", "").startswith("http"):
-            stream_url = track["url"]
-        else:
-            resolved = await resolve_track_url(video_id)
-            if not resolved:
-                continue
-            stream_url = resolved["url"]
-            title = resolved.get("title", title)
+        # Always resolve through yt-dlp to get the actual audio stream URL
+        resolved = await resolve_track_url(video_id)
+        if not resolved:
+            continue
+        stream_url = resolved["url"]
+        title = resolved.get("title", title)
 
         song = Song(title=title, url=stream_url, requester=member)
         state.queue.append(song)
