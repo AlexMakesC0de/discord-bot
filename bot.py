@@ -3,6 +3,7 @@ import re
 import random
 import asyncio
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 
 import discord
 from discord import app_commands
@@ -28,6 +29,9 @@ if SPOTIFY_CLIENT_ID and SPOTIFY_CLIENT_SECRET:
         )
     )
 
+# ── Thread pool for yt-dlp calls ──────────────────────────────────────────────
+ydl_pool = ThreadPoolExecutor(max_workers=4)
+
 # ── yt-dlp options ─────────────────────────────────────────────────────────────
 YDL_OPTS = {
     "format": "bestaudio/best",
@@ -39,8 +43,8 @@ YDL_OPTS = {
 }
 
 FFMPEG_OPTS = {
-    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
+    "before_options": "-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -probesize 200000 -analyzeduration 300000",
+    "options": "-vn -bufsize 64k",
 }
 
 # ── URL patterns ───────────────────────────────────────────────────────────────
@@ -60,12 +64,13 @@ SPOTIFY_PLAYLIST_RE = re.compile(
 
 # ── Helper dataclass ──────────────────────────────────────────────────────────
 class Song:
-    """Represents a queued song."""
+    """Represents a queued song. Supports lazy URL resolution."""
 
-    def __init__(self, title: str, url: str, requester: discord.Member):
+    def __init__(self, title: str, url: str, requester: discord.Member, search_query: str = None):
         self.title = title
-        self.url = url
+        self.url = url  # stream URL, or None if lazy
         self.requester = requester
+        self.search_query = search_query  # used for lazy resolution
 
 
 # ── Per-guild music state ─────────────────────────────────────────────────────
@@ -107,12 +112,11 @@ async def extract_info(query: str) -> dict | None:
     def _extract():
         with yt_dlp.YoutubeDL(YDL_OPTS) as ydl:
             info = ydl.extract_info(query, download=False)
-            # ytsearch returns a list of entries
             if "entries" in info:
                 return info["entries"][0] if info["entries"] else None
             return info
 
-    return await loop.run_in_executor(None, _extract)
+    return await loop.run_in_executor(ydl_pool, _extract)
 
 
 def resolve_spotify_query(url: str) -> str | None:
@@ -213,7 +217,7 @@ async def extract_playlist(query: str, max_tracks: int = 25) -> list[dict]:
                     return []
                 return list(playlist["entries"])[:max_tracks]
 
-    return await loop.run_in_executor(None, _extract)
+    return await loop.run_in_executor(ydl_pool, _extract)
 
 
 async def resolve_track_url(video_id: str) -> dict | None:
@@ -233,6 +237,17 @@ async def play_next(guild_id: int):
         return
 
     song = state.queue.popleft()
+
+    # Lazy resolution: resolve stream URL if not yet available
+    if song.url is None and song.search_query:
+        info = await extract_info(song.search_query)
+        if info is None:
+            # Skip this track and try the next one
+            await play_next(guild_id)
+            return
+        song.url = info["url"]
+        song.title = info.get("title", song.title)
+
     state.current = song
 
     source = discord.FFmpegOpusAudio(song.url, **FFMPEG_OPTS)
@@ -294,32 +309,21 @@ async def play(interaction: discord.Interaction, query: str):
 
     # Handle Spotify albums/playlists (multiple tracks)
     if spotify_multi:
-        queued_count = 0
-        first_song = None
         was_playing = state.voice_client.is_playing() or state.voice_client.is_paused()
 
+        # Queue all tracks lazily — no yt-dlp calls needed here
         for sq in spotify_multi:
-            info = await extract_info(f"ytsearch:{sq}")
-            if info is None:
-                continue
-            song = Song(title=info.get("title", "Unknown"), url=info["url"], requester=member)
+            song = Song(title=sq, url=None, requester=member, search_query=f"ytsearch:{sq}")
             state.queue.append(song)
-            queued_count += 1
-            if first_song is None:
-                first_song = song
-
-        if queued_count == 0:
-            await interaction.followup.send("❌ Could not find any tracks.")
-            return
 
         if not was_playing:
             await play_next(interaction.guild_id)
             await interaction.followup.send(
-                f"🎶 Now playing: **{first_song.title}**\n"
-                f"➕ Queued **{queued_count}** tracks from Spotify"
+                f"🎶 Now playing: **{state.current.title}**\n"
+                f"➕ Queued **{len(spotify_multi)}** tracks from Spotify"
             )
         else:
-            await interaction.followup.send(f"➕ Queued **{queued_count}** tracks from Spotify")
+            await interaction.followup.send(f"➕ Queued **{len(spotify_multi)}** tracks from Spotify")
         return
 
     info = await extract_info(search)
@@ -440,13 +444,8 @@ async def radio(interaction: discord.Interaction, genre: str = None):
     tracks = await extract_playlist(search_query)
 
     if not tracks:
-        # Fallback: search for individual videos as a pseudo-radio
-        fallback_tracks = []
-        for i in range(10):
-            info = await extract_info(f"ytsearch:{genre} music #{random.randint(1, 100)}")
-            if info:
-                fallback_tracks.append(info)
-        tracks = fallback_tracks
+        # Fallback: use search results as pseudo-radio (lazy, no resolution needed)
+        tracks = [{"title": f"{genre} music", "search": f"ytsearch:{genre} music #{random.randint(1, 100)}"} for _ in range(15)]
 
     if not tracks:
         await interaction.followup.send("❌ Couldn't find anything for that. Try a different genre.")
@@ -462,27 +461,26 @@ async def radio(interaction: discord.Interaction, genre: str = None):
         await asyncio.sleep(0.5)
 
     queued_count = 0
-    first_song = None
 
     for track in tracks:
+        # Playlist tracks have an id; fallback tracks have a search key
         video_id = track.get("id") or track.get("url", "")
         title = track.get("title", "Unknown")
+        search = track.get("search")
 
-        if not video_id:
+        if not video_id and not search:
             continue
 
-        # Always resolve through yt-dlp to get the actual audio stream URL
-        resolved = await resolve_track_url(video_id)
-        if not resolved:
-            continue
-        stream_url = resolved["url"]
-        title = resolved.get("title", title)
+        if search:
+            # Lazy — resolve when it's time to play
+            song = Song(title=title, url=None, requester=member, search_query=search)
+        else:
+            # Playlist track — resolve lazily via video ID
+            yt_url = f"https://www.youtube.com/watch?v={video_id}" if not video_id.startswith("http") else video_id
+            song = Song(title=title, url=None, requester=member, search_query=yt_url)
 
-        song = Song(title=title, url=stream_url, requester=member)
         state.queue.append(song)
         queued_count += 1
-        if first_song is None:
-            first_song = song
 
     if queued_count == 0:
         await interaction.followup.send("❌ Couldn't load any tracks. Try a different genre.")
@@ -491,7 +489,7 @@ async def radio(interaction: discord.Interaction, genre: str = None):
     await play_next(interaction.guild_id)
     await interaction.followup.send(
         f"📻 **Radio: {genre}** — loaded {queued_count} tracks (shuffled)\n"
-        f"🎶 Now playing: **{first_song.title}**"
+        f"🎶 Now playing: **{state.current.title}**"
     )
 
 
