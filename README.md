@@ -1,4 +1,4 @@
-# Discord Music Bot 🎵
+# Discord Music Bot
 
 A simple Discord music bot built with **discord.py**, **yt-dlp**, and **spotipy**.
 
