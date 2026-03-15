@@ -1,5 +1,6 @@
 import os
 import re
+import random
 import asyncio
 from collections import deque
 
@@ -120,6 +121,62 @@ def resolve_spotify_query(url: str) -> str | None:
     artist = track["artists"][0]["name"]
     title = track["name"]
     return f"{artist} - {title}"
+
+
+async def extract_playlist(query: str, max_tracks: int = 25) -> list[dict]:
+    """Search YouTube for a playlist matching the query and return its tracks."""
+    loop = asyncio.get_event_loop()
+
+    def _extract():
+        # Search for a playlist on YouTube
+        search_opts = {
+            "format": "bestaudio/best",
+            "quiet": True,
+            "no_warnings": True,
+            "extract_flat": "in_playlist",
+            "source_address": "0.0.0.0",
+        }
+        with yt_dlp.YoutubeDL(search_opts) as ydl:
+            results = ydl.extract_info(f"ytsearch5:{query} playlist", download=False)
+            if not results or "entries" not in results:
+                return []
+
+            # Find the first result that links to a playlist
+            playlist_url = None
+            for entry in results["entries"]:
+                url = entry.get("url", "")
+                if "list=" in url:
+                    playlist_url = url
+                    break
+
+            # If no playlist found in search, try a direct playlist search
+            if not playlist_url:
+                results = ydl.extract_info(f"ytsearchplaylist:{query}", download=False)
+                if not results or "entries" not in results or not results["entries"]:
+                    return []
+                # Fallback: use individual search results as a pseudo-playlist
+                return results["entries"][:max_tracks]
+
+            # Extract tracks from the playlist
+            playlist_opts = {
+                "format": "bestaudio/best",
+                "quiet": True,
+                "no_warnings": True,
+                "extract_flat": True,
+                "source_address": "0.0.0.0",
+            }
+            with yt_dlp.YoutubeDL(playlist_opts) as ydl2:
+                playlist = ydl2.extract_info(playlist_url, download=False)
+                if not playlist or "entries" not in playlist:
+                    return []
+                return list(playlist["entries"])[:max_tracks]
+
+    return await loop.run_in_executor(None, _extract)
+
+
+async def resolve_track_url(video_id: str) -> dict | None:
+    """Resolve a video ID into a streamable audio URL."""
+    return await extract_info(f"https://www.youtube.com/watch?v={video_id}")
 
 
 async def play_next(guild_id: int):
@@ -262,6 +319,100 @@ async def queue(interaction: discord.Interaction):
         lines.append("\n*Queue is empty — add more songs with /play*")
 
     await interaction.response.send_message("\n".join(lines))
+
+
+@bot.tree.command(name="radio", description="Start a radio — plays a shuffled playlist matching a genre or mood")
+@app_commands.describe(genre="Genre, mood, or theme (e.g. 'techno', 'chill lofi', 'rocket league music'). Leave empty for random.")
+async def radio(interaction: discord.Interaction, genre: str = None):
+    if not interaction.guild:
+        await interaction.response.send_message("This command only works in a server.", ephemeral=True)
+        return
+
+    member = interaction.guild.get_member(interaction.user.id)
+    if not member or not member.voice or not member.voice.channel:
+        await interaction.response.send_message("You need to be in a voice channel.", ephemeral=True)
+        return
+
+    await interaction.response.defer()
+
+    state = get_state(interaction.guild_id)
+    voice_channel = member.voice.channel
+
+    if state.voice_client is None or not state.voice_client.is_connected():
+        state.voice_client = await voice_channel.connect()
+    elif state.voice_client.channel != voice_channel:
+        await state.voice_client.move_to(voice_channel)
+
+    # Build the search query
+    random_genres = ["lofi hip hop", "synthwave", "classic rock", "jazz", "chill beats",
+                     "techno", "house", "drum and bass", "indie", "ambient", "rap mix",
+                     "80s hits", "90s hits", "video game music", "electronic"]
+    if genre:
+        search_query = f"{genre} mix"
+    else:
+        genre = random.choice(random_genres)
+        search_query = f"{genre} mix"
+
+    # Try to find a playlist
+    tracks = await extract_playlist(search_query)
+
+    if not tracks:
+        # Fallback: search for individual videos as a pseudo-radio
+        fallback_tracks = []
+        for i in range(10):
+            info = await extract_info(f"ytsearch:{genre} music #{random.randint(1, 100)}")
+            if info:
+                fallback_tracks.append(info)
+        tracks = fallback_tracks
+
+    if not tracks:
+        await interaction.followup.send("❌ Couldn't find anything for that. Try a different genre.")
+        return
+
+    # Shuffle and queue the tracks
+    random.shuffle(tracks)
+
+    # Clear existing queue for radio mode
+    state.queue.clear()
+    if state.voice_client.is_playing() or state.voice_client.is_paused():
+        state.voice_client.stop()
+        await asyncio.sleep(0.5)
+
+    queued_count = 0
+    first_song = None
+
+    for track in tracks:
+        video_id = track.get("id") or track.get("url", "")
+        title = track.get("title", "Unknown")
+
+        if not video_id:
+            continue
+
+        # For flat-extracted playlist entries, we need to resolve the actual stream URL
+        if track.get("url", "").startswith("http"):
+            stream_url = track["url"]
+        else:
+            resolved = await resolve_track_url(video_id)
+            if not resolved:
+                continue
+            stream_url = resolved["url"]
+            title = resolved.get("title", title)
+
+        song = Song(title=title, url=stream_url, requester=member)
+        state.queue.append(song)
+        queued_count += 1
+        if first_song is None:
+            first_song = song
+
+    if queued_count == 0:
+        await interaction.followup.send("❌ Couldn't load any tracks. Try a different genre.")
+        return
+
+    await play_next(interaction.guild_id)
+    await interaction.followup.send(
+        f"📻 **Radio: {genre}** — loaded {queued_count} tracks (shuffled)\n"
+        f"🎶 Now playing: **{first_song.title}**"
+    )
 
 
 bot.run(DISCORD_TOKEN)

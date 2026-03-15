@@ -5,6 +5,7 @@ A simple Discord music bot built with **discord.py**, **yt-dlp**, and **spotipy*
 ## Features
 
 - `/play <query>` — Play from a **YouTube URL**, **Spotify track URL**, or a **search query**
+- `/radio [genre]` — Start a shuffled radio based on a genre, mood, or theme (e.g. `/radio techno`, `/radio chill lofi`, `/radio rocket league music`). Omit the genre for a random mix.
 - `/skip` — Skip the current song
 - `/stop` — Stop playback and clear the queue
 - `/pause` / `/resume` — Pause and resume playback
